@@ -36,6 +36,9 @@ const RESPONSE_HEADER_A: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: ";
 const RESPONSE_HEADER_B: &[u8] = b"        ";
 const RESPONSE_HEADER_C: &[u8] = b"\r\n\r\n";
 
+const RESPONSE_HEADER_HTML: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ";
+
 static RESPONSE_HEADER: Lazy<Vec<u8>> =
     Lazy::new(|| [RESPONSE_HEADER_A, RESPONSE_HEADER_B, RESPONSE_HEADER_C].concat());
 
@@ -62,6 +65,8 @@ pub enum ConnectionError {
     ResponseSenderClosed,
     #[error("scrape channel error: {0}")]
     ScrapeChannelError(&'static str),
+    #[error("index channel error")]
+    IndexChannelError,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -167,9 +172,18 @@ where
                 .or(opt_peer_addr)
                 .ok_or(anyhow::anyhow!("Could not extract peer addr"))?;
 
-            let response = self.handle_request(request, peer_addr).await?;
+            match request {
+                Request::Index => {
+                    let torrents = self.handle_index_request().await?;
 
-            self.write_response(&response, peer_addr).await?;
+                    self.write_index_response(&torrents, peer_addr).await?;
+                }
+                request => {
+                    let response = self.handle_request(request, peer_addr).await?;
+
+                    self.write_response(&response, peer_addr).await?;
+                }
+            }
 
             if !self.config.network.keep_alive {
                 break;
@@ -349,6 +363,9 @@ where
                 self.wait_for_scrape_responses(response_receivers, pending_scrape_response)
                     .await
             }
+            Request::Index => Err(ConnectionError::Other(anyhow::anyhow!(
+                "index requests are handled separately"
+            ))),
         }
     }
 
@@ -386,6 +403,75 @@ where
                 break Ok(response);
             }
         }
+    }
+
+    /// Query all swarm workers for their known torrents and collect the
+    /// results into a single list. Good enough for a basic index view.
+    async fn handle_index_request(&self) -> Result<Vec<TorrentSummary>, ConnectionError> {
+        let num_swarm_workers = self.request_senders.nr_consumers();
+
+        let mut response_receivers = Vec::with_capacity(num_swarm_workers);
+
+        for consumer_index in 0..num_swarm_workers {
+            let (response_sender, response_receiver) = shared_channel::new_bounded(1);
+
+            response_receivers.push(response_receiver);
+
+            // Only fails when receiver is closed
+            self.request_senders
+                .send_to(consumer_index, ChannelRequest::Index { response_sender })
+                .await
+                .unwrap();
+        }
+
+        let mut responses = response_receivers
+            .into_iter()
+            .map(|receiver| async { receiver.connect().await.recv().await })
+            .collect::<FuturesUnordered<_>>();
+
+        let mut torrents = Vec::new();
+
+        while let Some(opt_response) = responses.next().await {
+            let response = opt_response.ok_or(ConnectionError::IndexChannelError)?;
+
+            torrents.extend(response.torrents);
+        }
+
+        torrents.sort_unstable_by_key(|summary| summary.info_hash);
+
+        Ok(torrents)
+    }
+
+    async fn write_index_response(
+        &mut self,
+        torrents: &[TorrentSummary],
+        peer_addr: CanonicalSocketAddr,
+    ) -> Result<(), ConnectionError> {
+        let body = render_index_html(torrents);
+
+        let mut buffer = Vec::with_capacity(RESPONSE_HEADER_HTML.len() + 20 + body.len());
+
+        buffer.extend_from_slice(RESPONSE_HEADER_HTML);
+        buffer.extend_from_slice(itoa::Buffer::new().format(body.len()).as_bytes());
+        buffer.extend_from_slice(b"\r\n\r\n");
+        buffer.extend_from_slice(body.as_bytes());
+
+        self.stream
+            .write_all(&buffer)
+            .await
+            .with_context(|| "write")?;
+        self.stream.flush().await.with_context(|| "flush")?;
+
+        #[cfg(feature = "metrics")]
+        ::metrics::counter!(
+            "aquatic_responses_total",
+            "type" => "index",
+            "ip_version" => peer_addr_to_ip_version_str(&peer_addr),
+            "worker_index" => self.worker_index_string.clone(),
+        )
+        .increment(1);
+
+        Ok(())
     }
 
     async fn write_response(
@@ -467,4 +553,99 @@ where
 
 fn calculate_request_consumer_index(config: &Config, info_hash: InfoHash) -> usize {
     (info_hash.0[0] as usize) % config.swarm_workers
+}
+
+fn render_index_html(torrents: &[TorrentSummary]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(1024 + torrents.len() * 128);
+
+    output.push_str(
+        "<!doctype html>\n\
+         <html lang=\"en\">\n\
+         <head>\n\
+         <meta charset=\"utf-8\">\n\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <title>BitTorrent tracker index</title>\n\
+         <style>\n\
+         body { font-family: sans-serif; margin: 2rem; }\n\
+         table { border-collapse: collapse; width: 100%; }\n\
+         th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }\n\
+         th { background: #eee; }\n\
+         code { font-family: monospace; }\n\
+         </style>\n\
+         </head>\n\
+         <body>\n\
+         <h1>BitTorrent tracker index</h1>\n",
+    );
+
+    if torrents.is_empty() {
+        output.push_str("<p>No torrents are currently known to this tracker.</p>\n");
+    } else {
+        let _ = write!(output, "<p>Known torrents: {}</p>\n", torrents.len());
+
+        output.push_str(
+            "<table>\n\
+             <thead>\n\
+             <tr><th>Info hash</th><th>Seeders</th><th>Leechers</th><th>Peers</th></tr>\n\
+             </thead>\n\
+             <tbody>\n",
+        );
+
+        for torrent in torrents {
+            let mut hash_bytes = [0u8; 40];
+
+            hex::encode_to_slice(torrent.info_hash.0, &mut hash_bytes).unwrap();
+
+            let hash = std::str::from_utf8(&hash_bytes).unwrap();
+
+            let _ = write!(
+                output,
+                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                hash,
+                torrent.seeders,
+                torrent.leechers,
+                torrent.seeders + torrent.leechers,
+            );
+        }
+
+        output.push_str("</tbody>\n</table>\n");
+    }
+
+    output.push_str(
+        "<p>Torrent names are not tracked; torrents are identified by their info hashes.</p>\n\
+         </body>\n\
+         </html>\n",
+    );
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_index_html() {
+        let torrents = vec![TorrentSummary {
+            info_hash: InfoHash([0xab; 20]),
+            seeders: 3,
+            leechers: 2,
+        }];
+
+        let html = render_index_html(&torrents);
+
+        assert!(html.contains("abababababababababababababababababababab"));
+        assert!(html.contains("Known torrents: 1"));
+        assert!(html.contains("<td>3</td>"));
+        assert!(html.contains("<td>2</td>"));
+        assert!(html.contains("<td>5</td>"));
+    }
+
+    #[test]
+    fn test_render_empty_index_html() {
+        let html = render_index_html(&[]);
+
+        assert!(html.contains("No torrents are currently known to this tracker"));
+    }
 }

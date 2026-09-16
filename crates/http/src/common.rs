@@ -6,6 +6,7 @@ use aquatic_common::CanonicalSocketAddr;
 pub use aquatic_common::ValidUntil;
 
 use aquatic_http_protocol::{
+    common::InfoHash,
     request::{AnnounceRequest, ScrapeRequest},
     response::{AnnounceResponse, ScrapeResponse},
 };
@@ -20,6 +21,20 @@ new_key_type! {
     pub struct ConnectionId;
 }
 
+/// Basic information about a known torrent, used for the index view
+#[derive(Debug, Clone, Copy)]
+pub struct TorrentSummary {
+    pub info_hash: InfoHash,
+    pub seeders: usize,
+    pub leechers: usize,
+}
+
+/// A swarm worker's response to an index request
+#[derive(Debug)]
+pub struct IndexResponse {
+    pub torrents: Vec<TorrentSummary>,
+}
+
 #[derive(Debug)]
 pub enum ChannelRequest {
     Announce {
@@ -31,6 +46,9 @@ pub enum ChannelRequest {
         request: ScrapeRequest,
         peer_addr: CanonicalSocketAddr,
         response_sender: SharedSender<ScrapeResponse>,
+    },
+    Index {
+        response_sender: SharedSender<IndexResponse>,
     },
 }
 

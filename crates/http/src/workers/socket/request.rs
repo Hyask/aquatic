@@ -27,6 +27,12 @@ pub fn parse_request(
             let path = http_request.path.ok_or(anyhow::anyhow!("no http path"))?;
             let request = Request::parse_http_get_path(path)?;
 
+            if matches!(request, Request::Index) && !config.run_index {
+                return Err(RequestParseError::Other(anyhow::anyhow!(
+                    "index page is not enabled"
+                )));
+            }
+
             let opt_peer_ip = if config.network.runs_behind_reverse_proxy {
                 let header_name = &config.network.reverse_proxy_ip_header_name;
                 let header_format = config.network.reverse_proxy_ip_header_format;
@@ -76,6 +82,29 @@ mod tests {
     use super::*;
 
     const REQUEST_START: &str = "GET /announce?info_hash=%04%0bkV%3f%5cr%14%a6%b7%98%adC%c3%c9.%40%24%00%b9&peer_id=-ABC940-5ert69muw5t8&port=12345&uploaded=1&downloaded=2&left=3&numwant=0&key=4ab4b877&compact=1&supportcrypto=1&event=started HTTP/1.1\r\nHost: example.com\r\n";
+
+    #[test]
+    fn test_parse_enabled_index_request() {
+        let mut config = Config::default();
+
+        config.run_index = true;
+
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        assert_eq!(parse_request(&config, request).unwrap().0, Request::Index);
+    }
+
+    #[test]
+    fn test_parse_disabled_index_request() {
+        let config = Config::default();
+
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        assert!(matches!(
+            parse_request(&config, request),
+            Err(RequestParseError::Other(_))
+        ));
+    }
 
     #[test]
     fn test_parse_peer_ip_header_multiple() {

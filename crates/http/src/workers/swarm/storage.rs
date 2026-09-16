@@ -14,6 +14,7 @@ use aquatic_http_protocol::request::*;
 use aquatic_http_protocol::response::ResponsePeer;
 use aquatic_http_protocol::response::*;
 
+use crate::common::TorrentSummary;
 use crate::config::Config;
 
 const SMALL_PEER_MAP_CAPACITY: usize = 4;
@@ -97,6 +98,33 @@ impl TorrentMaps {
         } else {
             self.ipv6.handle_scrape_request(config, request)
         }
+    }
+
+    pub fn get_torrent_summaries(&self) -> Vec<TorrentSummary> {
+        let mut map: BTreeMap<InfoHash, (usize, usize)> = BTreeMap::new();
+
+        for (info_hash, torrent_data) in &self.ipv4.torrents {
+            let stats = torrent_data.scrape_statistics();
+
+            map.insert(*info_hash, (stats.complete, stats.incomplete));
+        }
+
+        for (info_hash, torrent_data) in &self.ipv6.torrents {
+            let stats = torrent_data.scrape_statistics();
+
+            let entry = map.entry(*info_hash).or_insert((0, 0));
+
+            entry.0 += stats.complete;
+            entry.1 += stats.incomplete;
+        }
+
+        map.into_iter()
+            .map(|(info_hash, (seeders, leechers))| TorrentSummary {
+                info_hash,
+                seeders,
+                leechers,
+            })
+            .collect()
     }
 
     #[cfg(feature = "metrics")]

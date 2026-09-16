@@ -248,6 +248,7 @@ impl ScrapeRequest {
 pub enum Request {
     Announce(AnnounceRequest),
     Scrape(ScrapeRequest),
+    Index,
 }
 
 impl Request {
@@ -288,18 +289,24 @@ impl Request {
         let mut split_parts = path.splitn(2, '?');
 
         let location = split_parts.next().with_context(|| "no location")?;
-        let query_string = split_parts.next().with_context(|| "no query string")?;
+        let opt_query_string = split_parts.next();
 
-        if location == "/announce" {
+        if location == "/" || location == "/index" {
+            Ok(Request::Index)
+        } else if location == "/announce" {
+            let query_string = opt_query_string.with_context(|| "no query string")?;
+
             Ok(Request::Announce(AnnounceRequest::parse_query_string(
                 query_string,
             )?))
         } else if location == "/scrape" {
+            let query_string = opt_query_string.with_context(|| "no query string")?;
+
             Ok(Request::Scrape(ScrapeRequest::parse_query_string(
                 query_string,
             )?))
         } else {
-            Err(anyhow::anyhow!("Path must be /announce or /scrape"))
+            Err(anyhow::anyhow!("Path must be /announce, /scrape or /index"))
         }
     }
 
@@ -307,6 +314,7 @@ impl Request {
         match self {
             Self::Announce(r) => r.write_bytes(output, url_suffix),
             Self::Scrape(r) => r.write_bytes(output, url_suffix),
+            Self::Index => output.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         }
     }
 }
@@ -373,6 +381,19 @@ mod tests {
         assert_eq!(parsed_request, reference_request);
     }
 
+    #[test]
+    fn test_index_request_from_bytes() {
+        for path in ["/", "/index"] {
+            let mut bytes = Vec::new();
+
+            bytes.extend_from_slice(format!("GET {} HTTP/1.1\r\n\r\n", path).as_bytes());
+
+            let parsed_request = Request::parse_bytes(&bytes[..]).unwrap().unwrap();
+
+            assert_eq!(parsed_request, Request::Index);
+        }
+    }
+
     impl Arbitrary for AnnounceRequest {
         fn arbitrary(g: &mut Gen) -> Self {
             let key: Option<String> = Arbitrary::arbitrary(g);
@@ -401,10 +422,10 @@ mod tests {
 
     impl Arbitrary for Request {
         fn arbitrary(g: &mut Gen) -> Self {
-            if Arbitrary::arbitrary(g) {
-                Self::Announce(Arbitrary::arbitrary(g))
-            } else {
-                Self::Scrape(Arbitrary::arbitrary(g))
+            match u8::arbitrary(g) % 3 {
+                0 => Self::Announce(Arbitrary::arbitrary(g)),
+                1 => Self::Scrape(Arbitrary::arbitrary(g)),
+                _ => Self::Index,
             }
         }
     }

@@ -32,6 +32,11 @@ pub struct Config {
     /// generate responses and send them back to the socket workers.
     pub swarm_workers: usize,
     pub log_level: LogLevel,
+    /// Serve an index page listing known torrents at HTTP GET /
+    ///
+    /// Note that torrent names are not tracked, so torrents are identified by
+    /// their info hashes.
+    pub run_index: bool,
     pub network: NetworkConfig,
     pub protocol: ProtocolConfig,
     pub cleaning: CleaningConfig,
@@ -53,6 +58,7 @@ impl Default for Config {
             socket_workers: 1,
             swarm_workers: 1,
             log_level: LogLevel::default(),
+            run_index: false,
             network: NetworkConfig::default(),
             protocol: ProtocolConfig::default(),
             cleaning: CleaningConfig::default(),

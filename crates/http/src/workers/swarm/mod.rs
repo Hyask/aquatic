@@ -133,6 +133,15 @@ async fn handle_request_stream<S>(
                     ::log::error!("swarm worker could not send scrape response: {:#}", err);
                 }
             }
+            ChannelRequest::Index { response_sender } => {
+                let response = IndexResponse {
+                    torrents: torrents.borrow().get_torrent_summaries(),
+                };
+
+                if let Err(err) = response_sender.connect().await.send(response).await {
+                    ::log::error!("swarm worker could not send index response: {:#}", err);
+                }
+            }
         };
     }
 }
