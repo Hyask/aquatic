@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::Context;
 use compact_str::CompactString;
@@ -18,6 +19,9 @@ pub struct AnnounceRequest {
     /// Number of response peers wanted
     pub numwant: Option<usize>,
     pub key: Option<CompactString>,
+    /// IP address supplied by the client via the `ip`, `ipv4` or `ipv6` query
+    /// parameter, overriding the IP address found in the network packet
+    pub ip: Option<IpAddr>,
 }
 
 impl AnnounceRequest {
@@ -59,6 +63,11 @@ impl AnnounceRequest {
             output.write_all(::urlencoding::encode(key.as_str()).as_bytes())?;
         }
 
+        if let Some(ip) = self.ip {
+            output.write_all(b"&ip=")?;
+            output.write_all(ip.to_string().as_bytes())?;
+        }
+
         // Always ask for compact responses to ease load testing of non-aquatic trackers
         output.write_all(b"&compact=1")?;
 
@@ -79,6 +88,7 @@ impl AnnounceRequest {
         let mut event = AnnounceEvent::default();
         let mut opt_numwant = None;
         let mut opt_key = None;
+        let mut opt_ip = None;
 
         let query_string_bytes = query_string.as_bytes();
 
@@ -141,6 +151,27 @@ impl AnnounceRequest {
                     }
                     opt_key = Some(::urlencoding::decode(value)?.into());
                 }
+                "ip" => {
+                    opt_ip = Some(
+                        ::urlencoding::decode(value)?
+                            .parse::<IpAddr>()
+                            .with_context(|| "parse ip")?,
+                    );
+                }
+                "ipv4" => {
+                    opt_ip = Some(IpAddr::V4(
+                        ::urlencoding::decode(value)?
+                            .parse::<Ipv4Addr>()
+                            .with_context(|| "parse ipv4")?,
+                    ));
+                }
+                "ipv6" => {
+                    opt_ip = Some(IpAddr::V6(
+                        ::urlencoding::decode(value)?
+                            .parse::<Ipv6Addr>()
+                            .with_context(|| "parse ipv6")?,
+                    ));
+                }
                 k => {
                     ::log::debug!("ignored unrecognized key: {}", k)
                 }
@@ -163,6 +194,7 @@ impl AnnounceRequest {
             event,
             numwant: opt_numwant,
             key: opt_key,
+            ip: opt_ip,
         })
     }
 }
@@ -348,6 +380,7 @@ mod tests {
             event: AnnounceEvent::Started,
             numwant: Some(0),
             key: Some("4ab4b877".into()),
+            ip: None,
         })
     }
 
@@ -363,6 +396,27 @@ mod tests {
         let reference_request = get_reference_announce_request();
 
         assert_eq!(parsed_request, reference_request);
+    }
+
+    #[test]
+    fn test_announce_request_ip_override() {
+        for (parameter, value) in [
+            ("ip", "1.2.3.4"),
+            ("ip", "2001:db8::1"),
+            ("ipv4", "1.2.3.4"),
+            ("ipv6", "2001:db8::1"),
+        ] {
+            let path = format!("{}&{}={}", ANNOUNCE_REQUEST_PATH, parameter, value);
+
+            let parsed_request = Request::parse_http_get_path(&path).unwrap();
+
+            let expected_ip = value.parse::<IpAddr>().unwrap();
+
+            match parsed_request {
+                Request::Announce(request) => assert_eq!(request.ip, Some(expected_ip)),
+                other => panic!("expected announce request, got {:?}", other),
+            }
+        }
     }
 
     #[test]
@@ -408,6 +462,7 @@ mod tests {
                 event: Arbitrary::arbitrary(g),
                 numwant: Arbitrary::arbitrary(g),
                 key: key.map(|key| key.into()),
+                ip: Arbitrary::arbitrary(g),
             }
         }
     }

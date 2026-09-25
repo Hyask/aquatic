@@ -48,6 +48,11 @@
 
 ### aquatic_http
 
+#### Added
+
+* Allow clients to override the IP address that they are tracked by, by
+  supplying it in the `ip`, `ipv4` or `ipv6` announce query parameter.
+
 #### Changed
 
 * (Breaking) Open one socket each for IPv4 and IPv6. The config file now has

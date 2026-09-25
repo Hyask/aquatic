@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use arrayvec::ArrayVec;
@@ -45,6 +45,13 @@ impl TorrentMaps {
         peer_addr: CanonicalSocketAddr,
         request: AnnounceRequest,
     ) -> AnnounceResponse {
+        // A peer may override the IP address found in the network packet by
+        // supplying it in the `ip`, `ipv4` or `ipv6` announce query parameter
+        let peer_addr = match request.ip {
+            Some(ip) => CanonicalSocketAddr::new(SocketAddr::new(ip, peer_addr.get().port())),
+            None => peer_addr,
+        };
+
         match peer_addr.get().ip() {
             IpAddr::V4(peer_ip_address) => {
                 let (seeders, leechers, response_peers) =
@@ -569,5 +576,109 @@ impl PeerStatus {
         } else {
             Self::Leeching
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::make_rng;
+    use rand::rngs::SmallRng;
+
+    use super::*;
+
+    fn announce_request(
+        info_hash: InfoHash,
+        peer_id: [u8; 20],
+        port: u16,
+        ip: Option<IpAddr>,
+    ) -> AnnounceRequest {
+        AnnounceRequest {
+            info_hash,
+            peer_id: PeerId(peer_id),
+            port,
+            bytes_uploaded: 0,
+            bytes_downloaded: 0,
+            bytes_left: 100,
+            event: AnnounceEvent::Started,
+            numwant: None,
+            key: None,
+            ip,
+        }
+    }
+
+    fn socket_addr(ip: [u8; 4], port: u16) -> CanonicalSocketAddr {
+        CanonicalSocketAddr::new(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])),
+            port,
+        ))
+    }
+
+    #[test]
+    fn test_announce_ip_override() {
+        let config = Config::default();
+        let valid_until = ValidUntil::new(ServerStartInstant::new(), 120).unwrap();
+        let mut rng: SmallRng = make_rng();
+        let mut maps = TorrentMaps::new(0);
+
+        let info_hash = InfoHash([0; 20]);
+        let override_ip = Ipv4Addr::new(9, 9, 9, 9);
+
+        maps.handle_announce_request(
+            &config,
+            &mut rng,
+            valid_until,
+            socket_addr([10, 0, 0, 1], 5000),
+            announce_request(info_hash, [1; 20], 1111, Some(IpAddr::V4(override_ip))),
+        );
+
+        let response = maps.handle_announce_request(
+            &config,
+            &mut rng,
+            valid_until,
+            socket_addr([10, 0, 0, 2], 5001),
+            announce_request(info_hash, [2; 20], 2222, None),
+        );
+
+        assert_eq!(
+            response.peers.0,
+            vec![ResponsePeer {
+                ip_address: override_ip,
+                port: 1111,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_announce_without_ip_override_uses_packet_ip() {
+        let config = Config::default();
+        let valid_until = ValidUntil::new(ServerStartInstant::new(), 120).unwrap();
+        let mut rng: SmallRng = make_rng();
+        let mut maps = TorrentMaps::new(0);
+
+        let info_hash = InfoHash([0; 20]);
+
+        maps.handle_announce_request(
+            &config,
+            &mut rng,
+            valid_until,
+            socket_addr([10, 0, 0, 1], 5000),
+            announce_request(info_hash, [1; 20], 1111, None),
+        );
+
+        let response = maps.handle_announce_request(
+            &config,
+            &mut rng,
+            valid_until,
+            socket_addr([10, 0, 0, 2], 5001),
+            announce_request(info_hash, [2; 20], 2222, None),
+        );
+
+        assert_eq!(
+            response.peers.0,
+            vec![ResponsePeer {
+                ip_address: Ipv4Addr::new(10, 0, 0, 1),
+                port: 1111,
+            }]
+        );
     }
 }

@@ -49,6 +49,7 @@ fn create_announce_request(config: &Config, state: &LoadTestState, rng: &mut imp
         port: rng.random(),
         bytes_uploaded: 0,
         bytes_downloaded: 0,
+        ip: None,
     })
 }
 
