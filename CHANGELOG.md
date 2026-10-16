@@ -58,6 +58,16 @@
 * (Breaking) Open one socket each for IPv4 and IPv6. The config file now has
   one setting for each.
 
+#### Fixed
+
+* Answer requests that cannot be parsed (invalid path or query parameters,
+  malformed HTTP, too many headers, oversized requests) with a failure
+  response instead of hanging while waiting for more data. Previously the
+  client could be left waiting forever, eventually timing out and resetting
+  the connection.
+* Always write the whole response to the socket, rather than a single
+  potentially partial write.
+
 ## 0.9.0 - 2024-04-03
 
 ### General

@@ -227,9 +227,6 @@ impl ListenerState {
             ) => {
                 ::log::error!("connection closed: {:#}", err);
             }
-            Err(err @ ConnectionError::RequestBufferFull) => {
-                ::log::info!("connection closed: {:#}", err);
-            }
             Err(err) => {
                 ::log::debug!("connection closed: {:#}", err);
             }

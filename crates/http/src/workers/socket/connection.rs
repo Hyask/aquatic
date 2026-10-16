@@ -47,14 +47,22 @@ struct PendingScrapeResponse {
     stats: BTreeMap<InfoHash, ScrapeStatistics>,
 }
 
+/// Result of reading one request from a connection.
+///
+/// An unparseable request is not an error that should close the connection
+/// silently: the client is waiting for an answer, so we send it a failure
+/// response instead of reading forever.
+enum ReadRequestOutcome {
+    Request(Request, Option<CanonicalSocketAddr>),
+    Invalid(FailureResponse),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
     #[error("inactive")]
     Inactive,
     #[error("socket peer addr extraction failed")]
     NoSocketPeerAddr(String),
-    #[error("request buffer full")]
-    RequestBufferFull,
     #[error("response buffer full")]
     ResponseBufferFull,
     #[error("response buffer write error: {0}")]
@@ -166,7 +174,22 @@ where
         opt_stable_peer_addr: Option<CanonicalSocketAddr>,
     ) -> Result<(), ConnectionError> {
         loop {
-            let (request, opt_peer_addr) = self.read_request().await?;
+            let (request, opt_peer_addr) = match self.read_request().await? {
+                ReadRequestOutcome::Request(request, opt_peer_addr) => (request, opt_peer_addr),
+                ReadRequestOutcome::Invalid(failure) => {
+                    // The request could not be parsed, but the client is still
+                    // waiting for an answer. Send a failure response instead of
+                    // blocking on reading more data which may never arrive.
+                    self.write_response(&Response::Failure(failure), opt_stable_peer_addr)
+                        .await?;
+
+                    if !self.config.network.keep_alive {
+                        break;
+                    }
+
+                    continue;
+                }
+            };
 
             let peer_addr = opt_stable_peer_addr
                 .or(opt_peer_addr)
@@ -181,7 +204,7 @@ where
                 request => {
                     let response = self.handle_request(request, peer_addr).await?;
 
-                    self.write_response(&response, peer_addr).await?;
+                    self.write_response(&response, Some(peer_addr)).await?;
                 }
             }
 
@@ -193,14 +216,17 @@ where
         Ok(())
     }
 
-    async fn read_request(
-        &mut self,
-    ) -> Result<(Request, Option<CanonicalSocketAddr>), ConnectionError> {
+    async fn read_request(&mut self) -> Result<ReadRequestOutcome, ConnectionError> {
         self.request_buffer_position = 0;
 
         loop {
             if self.request_buffer_position == self.request_buffer.len() {
-                return Err(ConnectionError::RequestBufferFull);
+                // The client sent more data than the request buffer can hold
+                // without us being able to parse a complete request. Answer
+                // with a failure instead of closing the connection silently.
+                return Ok(ReadRequestOutcome::Invalid(FailureResponse {
+                    failure_reason: "Request too large".into(),
+                }));
             }
 
             let bytes_read = self
@@ -231,14 +257,29 @@ where
                         None
                     };
 
-                    return Ok((request, opt_peer_addr));
+                    return Ok(ReadRequestOutcome::Request(request, opt_peer_addr));
                 }
                 Err(RequestParseError::MoreDataNeeded) => continue,
                 Err(RequestParseError::RequiredPeerIpHeaderMissing(err)) => {
-                    panic!("Tracker configured as running behind reverse proxy, but no corresponding IP header set in request. Please check your reverse proxy setup as well as your aquatic configuration. Error: {:#}", err);
+                    // Do not panic: a single malformed request must not take
+                    // down a socket worker. Answer with a failure instead.
+                    ::log::error!(
+                        "Tracker configured as running behind reverse proxy, but no \
+                         corresponding IP header set in request. Please check your reverse \
+                         proxy setup as well as your aquatic configuration. Error: {:#}",
+                        err
+                    );
+
+                    return Ok(ReadRequestOutcome::Invalid(FailureResponse {
+                        failure_reason: "Missing peer IP header".into(),
+                    }));
                 }
                 Err(RequestParseError::Other(err)) => {
                     ::log::debug!("Failed parsing request: {:#}", err);
+
+                    return Ok(ReadRequestOutcome::Invalid(FailureResponse {
+                        failure_reason: "Invalid request".into(),
+                    }));
                 }
             }
         }
@@ -477,7 +518,9 @@ where
     async fn write_response(
         &mut self,
         response: &Response,
-        peer_addr: CanonicalSocketAddr,
+        // Not available for failure responses to requests received over a
+        // reverse proxy without a parseable peer IP header
+        peer_addr: Option<CanonicalSocketAddr>,
     ) -> Result<(), ConnectionError> {
         // Write body and final newline to response buffer
 
@@ -523,7 +566,7 @@ where
         // Write buffer to stream
 
         self.stream
-            .write(&self.response_buffer[..position])
+            .write_all(&self.response_buffer[..position])
             .await
             .with_context(|| "write")?;
         self.stream.flush().await.with_context(|| "flush")?;
@@ -536,15 +579,17 @@ where
                 Response::Failure(_) => "error",
             };
 
-            let ip_version_str = peer_addr_to_ip_version_str(&peer_addr);
+            if let Some(peer_addr) = peer_addr {
+                let ip_version_str = peer_addr_to_ip_version_str(&peer_addr);
 
-            ::metrics::counter!(
-                "aquatic_responses_total",
-                "type" => response_type,
-                "ip_version" => ip_version_str,
-                "worker_index" => self.worker_index_string.clone(),
-            )
-            .increment(1);
+                ::metrics::counter!(
+                    "aquatic_responses_total",
+                    "type" => response_type,
+                    "ip_version" => ip_version_str,
+                    "worker_index" => self.worker_index_string.clone(),
+                )
+                .increment(1);
+            }
         }
 
         Ok(())
