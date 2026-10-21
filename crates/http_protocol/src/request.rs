@@ -2,7 +2,6 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::Context;
-use compact_str::CompactString;
 
 use super::common::*;
 use super::utils::*;
@@ -18,7 +17,9 @@ pub struct AnnounceRequest {
     pub event: AnnounceEvent,
     /// Number of response peers wanted
     pub numwant: Option<usize>,
-    pub key: Option<CompactString>,
+    /// Opaque client-supplied key. It is percent-encoded on the wire and may
+    /// contain arbitrary bytes, so it is kept as raw bytes rather than a string
+    pub key: Option<Vec<u8>>,
     /// IP address supplied by the client via the `ip`, `ipv4` or `ipv6` query
     /// parameter, overriding the IP address found in the network packet
     pub ip: Option<IpAddr>,
@@ -60,7 +61,7 @@ impl AnnounceRequest {
 
         if let Some(ref key) = self.key {
             output.write_all(b"&key=")?;
-            output.write_all(::urlencoding::encode(key.as_str()).as_bytes())?;
+            output.write_all(::urlencoding::encode_binary(key).as_bytes())?;
         }
 
         if let Some(ip) = self.ip {
@@ -149,7 +150,7 @@ impl AnnounceRequest {
                     if value.len() > 100 {
                         return Err(anyhow::anyhow!("'key' is too long"));
                     }
-                    opt_key = Some(::urlencoding::decode(value)?.into());
+                    opt_key = Some(::urlencoding::decode_binary(value.as_bytes()).into_owned());
                 }
                 "ip" => {
                     opt_ip = Some(
@@ -396,6 +397,31 @@ mod tests {
         let reference_request = get_reference_announce_request();
 
         assert_eq!(parsed_request, reference_request);
+    }
+
+    #[test]
+    fn test_announce_request_with_binary_key() {
+        // aria2c sends a key that may contain arbitrary, non-UTF-8 bytes
+        let path = "/announce?info_hash=%C0%FD%E4%D1R%B47%CBi%29%0F%5D%8Bt%F1%F3%7B%91%87%B1&peer_id=A2-1-37-0-b%17o%7C%A3b%0D%C7%E3%D8&uploaded=0&downloaded=0&left=0&compact=1&key=o%7C%A3b%0D%C7%E3%D8&numwant=50&no_peer_id=1&port=6978&event=started&supportcrypto=1";
+
+        let parsed_request = Request::parse_http_get_path(path).unwrap();
+
+        let request = match parsed_request {
+            Request::Announce(request) => request,
+            other => panic!("expected announce request, got {:?}", other),
+        };
+
+        assert_eq!(request.key.as_deref(), Some(&b"o|\xA3b\r\xC7\xE3\xD8"[..]));
+
+        // Ensure binary keys survive a serialization round-trip
+        let request = Request::Announce(request);
+        let mut bytes = Vec::new();
+
+        request.write(&mut bytes, &[]).unwrap();
+
+        let parsed_request = Request::parse_bytes(&bytes).unwrap().unwrap();
+
+        assert_eq!(parsed_request, request);
     }
 
     #[test]
