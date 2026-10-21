@@ -23,17 +23,19 @@ pub trait Ip: ::std::fmt::Debug + Copy + Eq + ::std::hash::Hash {}
 
 impl Ip for Ipv4Addr {}
 impl Ip for Ipv6Addr {}
+impl Ip for IpAddr {}
 
 pub struct TorrentMaps {
-    pub ipv4: TorrentMap<Ipv4Addr>,
-    pub ipv6: TorrentMap<Ipv6Addr>,
+    /// Single swarm holding both IPv4 and IPv6 peers: the address family only
+    /// decides which response key (`peers` or `peers6`) a peer is written to,
+    /// not which swarm it lives in.
+    pub combined: TorrentMap<IpAddr>,
 }
 
 impl TorrentMaps {
     pub fn new(worker_index: usize) -> Self {
         Self {
-            ipv4: TorrentMap::new(worker_index, true),
-            ipv6: TorrentMap::new(worker_index, false),
+            combined: TorrentMap::new(worker_index),
         }
     }
 
@@ -52,77 +54,72 @@ impl TorrentMaps {
             None => peer_addr,
         };
 
-        match peer_addr.get().ip() {
-            IpAddr::V4(peer_ip_address) => {
-                let (seeders, leechers, response_peers) =
-                    self.ipv4.upsert_peer_and_get_response_peers(
-                        config,
-                        rng,
-                        valid_until,
-                        peer_ip_address,
-                        request,
-                    );
+        let (seeders, leechers, response_peers) =
+            self.combined.upsert_peer_and_get_response_peers(
+                config,
+                rng,
+                valid_until,
+                peer_addr.get().ip(),
+                request,
+            );
 
-                AnnounceResponse {
-                    complete: seeders,
-                    incomplete: leechers,
-                    announce_interval: config.protocol.peer_announce_interval,
-                    peers: ResponsePeerListV4(response_peers),
-                    peers6: ResponsePeerListV6(vec![]),
-                    warning_message: None,
-                }
-            }
-            IpAddr::V6(peer_ip_address) => {
-                let (seeders, leechers, response_peers) =
-                    self.ipv6.upsert_peer_and_get_response_peers(
-                        config,
-                        rng,
-                        valid_until,
-                        peer_ip_address,
-                        request,
-                    );
+        // The tracker protocol still transports IPv4 and IPv6 peers in separate
+        // compact fields, so split the single swarm by family at encoding time.
+        let (peers4, peers6): (Vec<_>, Vec<_>) = response_peers
+            .into_iter()
+            .partition(|peer| peer.ip_address.is_ipv4());
 
-                AnnounceResponse {
-                    complete: seeders,
-                    incomplete: leechers,
-                    announce_interval: config.protocol.peer_announce_interval,
-                    peers: ResponsePeerListV4(vec![]),
-                    peers6: ResponsePeerListV6(response_peers),
-                    warning_message: None,
-                }
-            }
+        let peers = ResponsePeerListV4(
+            peers4
+                .into_iter()
+                .map(|peer| ResponsePeer {
+                    ip_address: match peer.ip_address {
+                        IpAddr::V4(ip) => ip,
+                        IpAddr::V6(_) => unreachable!(),
+                    },
+                    port: peer.port,
+                })
+                .collect(),
+        );
+        let peers6 = ResponsePeerListV6(
+            peers6
+                .into_iter()
+                .map(|peer| ResponsePeer {
+                    ip_address: match peer.ip_address {
+                        IpAddr::V6(ip) => ip,
+                        IpAddr::V4(_) => unreachable!(),
+                    },
+                    port: peer.port,
+                })
+                .collect(),
+        );
+
+        AnnounceResponse {
+            complete: seeders,
+            incomplete: leechers,
+            announce_interval: config.protocol.peer_announce_interval,
+            peers,
+            peers6,
+            warning_message: None,
         }
     }
 
     pub fn handle_scrape_request(
         &mut self,
         config: &Config,
-        peer_addr: CanonicalSocketAddr,
+        _peer_addr: CanonicalSocketAddr,
         request: ScrapeRequest,
     ) -> ScrapeResponse {
-        if peer_addr.get().ip().is_ipv4() {
-            self.ipv4.handle_scrape_request(config, request)
-        } else {
-            self.ipv6.handle_scrape_request(config, request)
-        }
+        self.combined.handle_scrape_request(config, request)
     }
 
     pub fn get_torrent_summaries(&self) -> Vec<TorrentSummary> {
         let mut map: BTreeMap<InfoHash, (usize, usize)> = BTreeMap::new();
 
-        for (info_hash, torrent_data) in &self.ipv4.torrents {
+        for (info_hash, torrent_data) in &self.combined.torrents {
             let stats = torrent_data.scrape_statistics();
 
             map.insert(*info_hash, (stats.complete, stats.incomplete));
-        }
-
-        for (info_hash, torrent_data) in &self.ipv6.torrents {
-            let stats = torrent_data.scrape_statistics();
-
-            let entry = map.entry(*info_hash).or_insert((0, 0));
-
-            entry.0 += stats.complete;
-            entry.1 += stats.incomplete;
         }
 
         map.into_iter()
@@ -136,8 +133,9 @@ impl TorrentMaps {
 
     #[cfg(feature = "metrics")]
     pub fn update_torrent_metrics(&self) {
-        self.ipv4.torrent_gauge.set(self.ipv4.torrents.len() as f64);
-        self.ipv6.torrent_gauge.set(self.ipv6.torrents.len() as f64);
+        self.combined
+            .torrent_gauge
+            .set(self.combined.torrents.len() as f64);
     }
 
     pub fn clean(
@@ -149,8 +147,7 @@ impl TorrentMaps {
         let mut access_list_cache = create_access_list_cache(access_list);
 
         if let Some(now) = server_start_instant.seconds_elapsed() {
-            self.ipv4.clean(config, &mut access_list_cache, now);
-            self.ipv6.clean(config, &mut access_list_cache, now);
+            self.combined.clean(config, &mut access_list_cache, now);
         } else {
             ::log::warn!("Could not clean torrents due to monotonicity error");
         }
@@ -166,35 +163,19 @@ pub struct TorrentMap<I: Ip> {
 }
 
 impl<I: Ip> TorrentMap<I> {
-    fn new(worker_index: usize, ipv4: bool) -> Self {
+    fn new(worker_index: usize) -> Self {
         #[cfg(feature = "metrics")]
-        let peer_gauge = if ipv4 {
-            ::metrics::gauge!(
-                "aquatic_peers",
-                "ip_version" => "4",
-                "worker_index" => worker_index.to_string(),
-            )
-        } else {
-            ::metrics::gauge!(
-                "aquatic_peers",
-                "ip_version" => "6",
-                "worker_index" => worker_index.to_string(),
-            )
-        };
+        let peer_gauge = ::metrics::gauge!(
+            "aquatic_peers",
+            "ip_version" => "4+6",
+            "worker_index" => worker_index.to_string(),
+        );
         #[cfg(feature = "metrics")]
-        let torrent_gauge = if ipv4 {
-            ::metrics::gauge!(
-                "aquatic_torrents",
-                "ip_version" => "4",
-                "worker_index" => worker_index.to_string(),
-            )
-        } else {
-            ::metrics::gauge!(
-                "aquatic_torrents",
-                "ip_version" => "6",
-                "worker_index" => worker_index.to_string(),
-            )
-        };
+        let torrent_gauge = ::metrics::gauge!(
+            "aquatic_torrents",
+            "ip_version" => "4+6",
+            "worker_index" => worker_index.to_string(),
+        );
 
         Self {
             torrents: Default::default(),
