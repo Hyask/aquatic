@@ -27,7 +27,7 @@ use crate::config::Config;
 
 #[cfg(feature = "metrics")]
 use super::peer_addr_to_ip_version_str;
-use super::request::{parse_request, RequestParseError};
+use super::request::{parse_request, RequestMetadata, RequestParseError};
 
 const REQUEST_BUFFER_SIZE: usize = 2048;
 const RESPONSE_BUFFER_SIZE: usize = 4096;
@@ -53,7 +53,7 @@ struct PendingScrapeResponse {
 /// silently: the client is waiting for an answer, so we send it a failure
 /// response instead of reading forever.
 enum ReadRequestOutcome {
-    Request(Request, Option<CanonicalSocketAddr>),
+    Request(Request, Option<CanonicalSocketAddr>, RequestMetadata),
     Invalid(FailureResponse),
 }
 
@@ -174,8 +174,10 @@ where
         opt_stable_peer_addr: Option<CanonicalSocketAddr>,
     ) -> Result<(), ConnectionError> {
         loop {
-            let (request, opt_peer_addr) = match self.read_request().await? {
-                ReadRequestOutcome::Request(request, opt_peer_addr) => (request, opt_peer_addr),
+            let (request, opt_peer_addr, metadata) = match self.read_request().await? {
+                ReadRequestOutcome::Request(request, opt_peer_addr, metadata) => {
+                    (request, opt_peer_addr, metadata)
+                }
                 ReadRequestOutcome::Invalid(failure) => {
                     // The request could not be parsed, but the client is still
                     // waiting for an answer. Send a failure response instead of
@@ -199,7 +201,8 @@ where
                 Request::Index => {
                     let torrents = self.handle_index_request().await?;
 
-                    self.write_index_response(&torrents, peer_addr).await?;
+                    self.write_index_response(&torrents, peer_addr, &metadata)
+                        .await?;
                 }
                 request => {
                     let response = self.handle_request(request, peer_addr).await?;
@@ -244,7 +247,7 @@ where
             let buffer_slice = &self.request_buffer[..self.request_buffer_position];
 
             match parse_request(&self.config, buffer_slice) {
-                Ok((request, opt_peer_ip)) => {
+                Ok((request, opt_peer_ip, metadata)) => {
                     let opt_peer_addr = if self.config.network.runs_behind_reverse_proxy {
                         let peer_ip = opt_peer_ip
                             .expect("logic error: peer ip must have been extracted at this point");
@@ -257,7 +260,11 @@ where
                         None
                     };
 
-                    return Ok(ReadRequestOutcome::Request(request, opt_peer_addr));
+                    return Ok(ReadRequestOutcome::Request(
+                        request,
+                        opt_peer_addr,
+                        metadata,
+                    ));
                 }
                 Err(RequestParseError::MoreDataNeeded) => continue,
                 Err(RequestParseError::RequiredPeerIpHeaderMissing(err)) => {
@@ -487,8 +494,11 @@ where
         &mut self,
         torrents: &[TorrentSummary],
         peer_addr: CanonicalSocketAddr,
+        metadata: &RequestMetadata,
     ) -> Result<(), ConnectionError> {
-        let body = render_index_html(torrents);
+        let opt_announce_url = infer_announce_url(&self.config, metadata);
+
+        let body = render_index_html(torrents, opt_announce_url.as_deref());
 
         let mut buffer = Vec::with_capacity(RESPONSE_HEADER_HTML.len() + 20 + body.len());
 
@@ -600,7 +610,59 @@ fn calculate_request_consumer_index(config: &Config, info_hash: InfoHash) -> usi
     (info_hash.0[0] as usize) % config.swarm_workers
 }
 
-fn render_index_html(torrents: &[TorrentSummary]) -> String {
+/// Determine the announce URL to advertise on the index page, either from
+/// configuration or, failing that, from request headers.
+///
+/// The scheme is taken from the `X-Forwarded-Proto` header if present (as set
+/// by a reverse proxy terminating TLS), and otherwise from the
+/// `network.enable_tls` setting. Returns `None` if no host is available, in
+/// which case magnet links are rendered without a tracker.
+fn infer_announce_url(config: &Config, metadata: &RequestMetadata) -> Option<String> {
+    if !config.index.announce_url.is_empty() {
+        return Some(config.index.announce_url.clone());
+    }
+
+    let host = metadata
+        .opt_host
+        .as_deref()
+        .filter(|host| !host.is_empty())?;
+
+    let scheme = metadata
+        .opt_forwarded_proto
+        .as_deref()
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|proto| !proto.is_empty())
+        .unwrap_or(if config.network.enable_tls {
+            "https"
+        } else {
+            "http"
+        });
+
+    Some(format!("{}://{}/announce", scheme, host))
+}
+
+/// Percent-encode a string for use as a magnet link query parameter value.
+fn percent_encode(input: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(input.len());
+
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(byte as char);
+            }
+            _ => {
+                let _ = write!(output, "%{:02X}", byte);
+            }
+        }
+    }
+
+    output
+}
+
+fn render_index_html(torrents: &[TorrentSummary], opt_announce_url: Option<&str>) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::with_capacity(1024 + torrents.len() * 128);
@@ -644,10 +706,17 @@ fn render_index_html(torrents: &[TorrentSummary]) -> String {
 
             let hash = std::str::from_utf8(&hash_bytes).unwrap();
 
+            let mut magnet = format!("magnet:?xt=urn:btih:{}", hash);
+
+            if let Some(announce_url) = opt_announce_url {
+                let _ = write!(magnet, "&tr={}", percent_encode(announce_url));
+            }
+
             let _ = write!(
                 output,
-                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                "<tr><td><code>{}</code> (<a href=\"{}\">magnet</a>)</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
                 hash,
+                magnet,
                 torrent.seeders,
                 torrent.leechers,
                 torrent.seeders + torrent.leechers,
@@ -678,19 +747,118 @@ mod tests {
             leechers: 2,
         }];
 
-        let html = render_index_html(&torrents);
+        let html = render_index_html(&torrents, Some("https://tracker.example.com/announce"));
 
         assert!(html.contains("abababababababababababababababababababab"));
         assert!(html.contains("Known torrents: 1"));
         assert!(html.contains("<td>3</td>"));
         assert!(html.contains("<td>2</td>"));
         assert!(html.contains("<td>5</td>"));
+        assert!(html.contains(
+            "magnet:?xt=urn:btih:abababababababababababababababababababab\
+             &tr=https%3A%2F%2Ftracker.example.com%2Fannounce"
+        ));
+    }
+
+    #[test]
+    fn test_render_index_html_without_announce_url() {
+        let torrents = vec![TorrentSummary {
+            info_hash: InfoHash([0xab; 20]),
+            seeders: 3,
+            leechers: 2,
+        }];
+
+        let html = render_index_html(&torrents, None);
+
+        assert!(html.contains("magnet:?xt=urn:btih:abababababababababababababababababababab\""));
+        assert!(!html.contains("&tr="));
     }
 
     #[test]
     fn test_render_empty_index_html() {
-        let html = render_index_html(&[]);
+        let html = render_index_html(&[], None);
 
         assert!(html.contains("No torrents are currently known to this tracker"));
+    }
+
+    #[test]
+    fn test_infer_announce_url_from_config() {
+        let mut config = Config::default();
+
+        config.index.announce_url = "https://tracker.example.com/announce".into();
+
+        let metadata = RequestMetadata {
+            opt_host: Some("other.example.com".into()),
+            opt_forwarded_proto: None,
+        };
+
+        assert_eq!(
+            infer_announce_url(&config, &metadata).as_deref(),
+            Some("https://tracker.example.com/announce")
+        );
+    }
+
+    #[test]
+    fn test_infer_announce_url_from_host() {
+        let config = Config::default();
+
+        let metadata = RequestMetadata {
+            opt_host: Some("tracker.example.com:3000".into()),
+            opt_forwarded_proto: None,
+        };
+
+        assert_eq!(
+            infer_announce_url(&config, &metadata).as_deref(),
+            Some("http://tracker.example.com:3000/announce")
+        );
+    }
+
+    #[test]
+    fn test_infer_announce_url_from_host_using_tls() {
+        let mut config = Config::default();
+
+        config.network.enable_tls = true;
+
+        let metadata = RequestMetadata {
+            opt_host: Some("tracker.example.com".into()),
+            opt_forwarded_proto: None,
+        };
+
+        assert_eq!(
+            infer_announce_url(&config, &metadata).as_deref(),
+            Some("https://tracker.example.com/announce")
+        );
+    }
+
+    #[test]
+    fn test_infer_announce_url_from_host_using_forwarded_proto() {
+        let config = Config::default();
+
+        let metadata = RequestMetadata {
+            opt_host: Some("tracker.example.com".into()),
+            opt_forwarded_proto: Some("https, http".into()),
+        };
+
+        assert_eq!(
+            infer_announce_url(&config, &metadata).as_deref(),
+            Some("https://tracker.example.com/announce")
+        );
+    }
+
+    #[test]
+    fn test_infer_announce_url_without_host() {
+        let config = Config::default();
+
+        let metadata = RequestMetadata::default();
+
+        assert_eq!(infer_announce_url(&config, &metadata), None);
+    }
+
+    #[test]
+    fn test_percent_encode() {
+        assert_eq!(
+            percent_encode("https://tracker.example.com/announce?a=b&c=d"),
+            "https%3A%2F%2Ftracker.example.com%2Fannounce%3Fa%3Db%26c%3Dd"
+        );
     }
 }

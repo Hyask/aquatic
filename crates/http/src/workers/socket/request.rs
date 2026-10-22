@@ -15,10 +15,20 @@ pub enum RequestParseError {
     Other(#[from] anyhow::Error),
 }
 
+/// Header values from a request that are needed to build the announce URL
+/// advertised on the index page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestMetadata {
+    /// Value of the `Host` header, if present
+    pub opt_host: Option<String>,
+    /// Value of the `X-Forwarded-Proto` header, if present
+    pub opt_forwarded_proto: Option<String>,
+}
+
 pub fn parse_request(
     config: &Config,
     buffer: &[u8],
-) -> Result<(Request, Option<IpAddr>), RequestParseError> {
+) -> Result<(Request, Option<IpAddr>, RequestMetadata), RequestParseError> {
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut http_request = httparse::Request::new(&mut headers);
 
@@ -47,10 +57,24 @@ pub fn parse_request(
                 None
             };
 
-            Ok((request, opt_peer_ip))
+            let metadata = RequestMetadata {
+                opt_host: parse_header_value("host", http_request.headers),
+                opt_forwarded_proto: parse_header_value("x-forwarded-proto", http_request.headers),
+            };
+
+            Ok((request, opt_peer_ip, metadata))
         }
         httparse::Status::Partial => Err(RequestParseError::MoreDataNeeded),
     }
+}
+
+/// Return the value of the first case-insensitively matching header, if any.
+fn parse_header_value(header_name: &str, headers: &[httparse::Header<'_>]) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(header_name))
+        .and_then(|header| std::str::from_utf8(header.value).ok())
+        .map(|value| value.trim().to_string())
 }
 
 fn parse_forwarded_header(
@@ -92,6 +116,21 @@ mod tests {
         let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
 
         assert_eq!(parse_request(&config, request).unwrap().0, Request::Index);
+    }
+
+    #[test]
+    fn test_parse_request_metadata() {
+        let mut config = Config::default();
+
+        config.run_index = true;
+
+        let request =
+            b"GET / HTTP/1.1\r\nHost: example.com:3000\r\nX-Forwarded-Proto: https\r\n\r\n";
+
+        let metadata = parse_request(&config, request).unwrap().2;
+
+        assert_eq!(metadata.opt_host.as_deref(), Some("example.com:3000"));
+        assert_eq!(metadata.opt_forwarded_proto.as_deref(), Some("https"));
     }
 
     #[test]

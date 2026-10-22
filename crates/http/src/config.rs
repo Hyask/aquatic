@@ -37,6 +37,8 @@ pub struct Config {
     /// Note that torrent names are not tracked, so torrents are identified by
     /// their info hashes.
     pub run_index: bool,
+    /// Index page configuration
+    pub index: IndexConfig,
     pub network: NetworkConfig,
     pub protocol: ProtocolConfig,
     pub cleaning: CleaningConfig,
@@ -59,6 +61,7 @@ impl Default for Config {
             swarm_workers: 1,
             log_level: LogLevel::default(),
             run_index: false,
+            index: IndexConfig::default(),
             network: NetworkConfig::default(),
             protocol: ProtocolConfig::default(),
             cleaning: CleaningConfig::default(),
@@ -73,6 +76,27 @@ impl Default for Config {
 impl aquatic_common::cli::Config for Config {
     fn get_log_level(&self) -> Option<LogLevel> {
         Some(self.log_level)
+    }
+}
+
+/// Index page configuration
+#[derive(Clone, Debug, PartialEq, TomlConfig, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexConfig {
+    /// Announce URL to advertise in magnet links on the index page
+    ///
+    /// For example: `https://tracker.example.com/announce`. If left empty, the
+    /// announce URL is inferred from the `Host` header of the incoming request.
+    /// The scheme is taken from `X-Forwarded-Proto` if present, and otherwise
+    /// from the `network.enable_tls` setting.
+    pub announce_url: String,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            announce_url: String::new(),
+        }
     }
 }
 
