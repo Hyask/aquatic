@@ -32,11 +32,6 @@ pub struct Config {
     /// generate responses and send them back to the socket workers.
     pub swarm_workers: usize,
     pub log_level: LogLevel,
-    /// Serve an index page listing known torrents at HTTP GET /
-    ///
-    /// Note that torrent names are not tracked, so torrents are identified by
-    /// their info hashes.
-    pub run_index: bool,
     /// Index page configuration
     pub index: IndexConfig,
     pub network: NetworkConfig,
@@ -60,7 +55,6 @@ impl Default for Config {
             socket_workers: 1,
             swarm_workers: 1,
             log_level: LogLevel::default(),
-            run_index: false,
             index: IndexConfig::default(),
             network: NetworkConfig::default(),
             protocol: ProtocolConfig::default(),
@@ -83,6 +77,11 @@ impl aquatic_common::cli::Config for Config {
 #[derive(Clone, Debug, PartialEq, TomlConfig, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
+    /// Serve an index page listing known torrents at HTTP GET /
+    ///
+    /// Note that torrent names are not tracked, so torrents are identified by
+    /// their info hashes.
+    pub run_index: bool,
     /// Announce URL to advertise in magnet links on the index page
     ///
     /// For example: `https://tracker.example.com/announce`. If left empty, the
@@ -95,6 +94,7 @@ pub struct IndexConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
+            run_index: false,
             announce_url: String::new(),
         }
     }

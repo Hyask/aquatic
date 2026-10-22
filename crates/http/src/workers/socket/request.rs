@@ -37,7 +37,7 @@ pub fn parse_request(
             let path = http_request.path.ok_or(anyhow::anyhow!("no http path"))?;
             let request = Request::parse_http_get_path(path)?;
 
-            if matches!(request, Request::Index) && !config.run_index {
+            if matches!(request, Request::Index) && !config.index.run_index {
                 return Err(RequestParseError::Other(anyhow::anyhow!(
                     "index page is not enabled"
                 )));
@@ -111,7 +111,7 @@ mod tests {
     fn test_parse_enabled_index_request() {
         let mut config = Config::default();
 
-        config.run_index = true;
+        config.index.run_index = true;
 
         let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
 
@@ -122,7 +122,7 @@ mod tests {
     fn test_parse_request_metadata() {
         let mut config = Config::default();
 
-        config.run_index = true;
+        config.index.run_index = true;
 
         let request =
             b"GET / HTTP/1.1\r\nHost: example.com:3000\r\nX-Forwarded-Proto: https\r\n\r\n";
